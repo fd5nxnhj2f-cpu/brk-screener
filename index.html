@@ -785,12 +785,86 @@ function signal(sc){
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
+// ── Sentiment Score — blends Analyst trend + Insider MSPR trend ────────────────
+function computeSentimentScore(recommend, mspr){
+  let analystScore=null, analystTrendDelta=null, insiderScore=null, insiderTrendScore=null;
+
+  if(Array.isArray(recommend)&&recommend.length){
+    const rec=recommend[0];
+    const total=rec.strongBuy+rec.buy+rec.hold+rec.sell+rec.strongSell;
+    if(total>0){
+      const bullish=rec.strongBuy+rec.buy;
+      analystScore=(bullish/total)*100;
+      if(recommend.length>=4){
+        const past=recommend[3];
+        const pastTotal=past.strongBuy+past.buy+past.hold+past.sell+past.strongSell;
+        if(pastTotal>0){
+          const pastBullish=past.strongBuy+past.buy;
+          analystTrendDelta=((bullish/total)*100)-((pastBullish/pastTotal)*100);
+        }
+      }
+    }
+  }
+
+  if(Array.isArray(mspr)&&mspr.length){
+    const sorted=[...mspr].sort((a,b)=>(a.year*12+a.month)-(b.year*12+b.month));
+    const latest=sorted[sorted.length-1];
+    insiderScore=(latest.mspr+100)/2; // -100..100 -> 0..100
+    if(sorted.length>=2){
+      const positives=sorted.filter(s=>s.mspr>0).length;
+      const negatives=sorted.filter(s=>s.mspr<0).length;
+      insiderTrendScore = positives>negatives ? 10 : negatives>positives ? -10 : 0;
+    }
+  }
+
+  // Combine whatever's available — average the two core signals, apply trend bonuses
+  const coreScores=[analystScore, insiderScore].filter(v=>v!=null);
+  if(!coreScores.length) return null; // no sentiment data at all
+
+  let sentimentScore = coreScores.reduce((a,b)=>a+b,0)/coreScores.length;
+  if(analystTrendDelta!=null) sentimentScore += Math.max(-10, Math.min(10, analystTrendDelta*0.5));
+  if(insiderTrendScore!=null) sentimentScore += insiderTrendScore;
+  sentimentScore = Math.max(0, Math.min(100, Math.round(sentimentScore)));
+
+  return { sentimentScore, analystScore, analystTrendDelta, insiderScore, insiderTrendScore };
+}
+
+// ── Master Score — blends Technical (60%) + Sentiment (40%) with divergence flag
+function computeMasterScore(techScore, sentimentData){
+  if(sentimentData==null){
+    // No sentiment data available — master score falls back to technical only
+    return { masterScore:techScore, techScore, sentimentScore:null, divergence:null };
+  }
+  const sentimentScore=sentimentData.sentimentScore;
+  const masterScore=Math.round(techScore*0.6 + sentimentScore*0.4);
+
+  let divergence=null;
+  if(techScore>=65 && sentimentScore<=40){
+    divergence={ label:'⚠ STRONG FUNDAMENTALS, WEAK SENTIMENT', color:'var(--gold)',
+                 detail:'Numbers look great but market mood is cautious — check recent news for what the data might be missing.' };
+  } else if(techScore<=40 && sentimentScore>=65){
+    divergence={ label:'👀 WEAK FUNDAMENTALS, STRONG SENTIMENT', color:'var(--gold)',
+                 detail:'Sentiment is bullish despite so-so fundamentals — could be speculative or a turnaround story not yet in the numbers.' };
+  } else if(techScore>=60 && sentimentScore>=60){
+    divergence={ label:'✓ ALIGNED — FUNDAMENTALS + SENTIMENT AGREE', color:'var(--green)',
+                 detail:'Both the numbers and the mood support this stock — higher conviction.' };
+  } else if(techScore<=40 && sentimentScore<=40){
+    divergence={ label:'✗ ALIGNED — BOTH WEAK', color:'var(--red)',
+                 detail:'Neither the fundamentals nor sentiment support this stock right now.' };
+  }
+
+  return { masterScore, techScore, sentimentScore, divergence };
+}
+
 function renderCard(d){
   const{stock:st,quote:q,metric:m,earnings,recommend,insiders,mspr,news,sig,earnDate}=d;
   const qq=q||{}, mm=m||{};
   const isBrk=BRK_SET.has(st.t);
-  const sc=score(qq,mm);
-  const{s,l}=sig||signal(sc);
+  const rawSc=score(qq,mm);
+  const sc=Math.max(0,Math.min(100,rawSc)); // clamp for display consistency
+  const sentimentData=computeSentimentScore(recommend, mspr);
+  const master=computeMasterScore(sc, sentimentData);
+  const{s,l}=signal(master.masterScore); // footer signal now driven by combined master score
   const scC=sc>=65?'#2d6a4f':sc>=50?'#b5890a':'#c1440e';
 
   const pe=mm.peTTM;
@@ -841,6 +915,30 @@ function renderCard(d){
     <div class="fi"><div class="fl">52W Position</div><div class="fv ${pos52C}">${pos52!=null?pos52+'% of range':'—'}</div></div>
     <div class="fi"><div class="fl">Market Cap</div><div class="fv n">${B(mktCap)}</div></div>
   </div>
+  <div class="sec-t">🎯 MASTER SCORE (TECHNICAL + SENTIMENT)</div>
+  <div style="padding:10px 16px;border-bottom:1px solid var(--border);">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
+      <span style="font-family:var(--mono);font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:1px;">Master Score</span>
+      <span style="font-family:var(--mono);font-size:22px;font-weight:600;color:${master.masterScore>=65?'var(--green)':master.masterScore>=50?'var(--gold)':'var(--red)'};">${master.masterScore}/100</span>
+    </div>
+    <div class="bar-bg" style="height:8px;margin-bottom:10px;"><div class="bar-fill" style="width:${master.masterScore}%;background:${master.masterScore>=65?'var(--green)':master.masterScore>=50?'var(--gold)':'var(--red)'};"></div></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px;">
+      <div>
+        <div style="font-family:var(--mono);font-size:8px;color:var(--ink3);text-transform:uppercase;">Technical (60%)</div>
+        <div style="font-family:var(--mono);font-size:14px;color:${sc>=65?'var(--green)':sc>=50?'var(--gold)':'var(--red)'};">${sc}/100</div>
+      </div>
+      <div>
+        <div style="font-family:var(--mono);font-size:8px;color:var(--ink3);text-transform:uppercase;">Sentiment (40%)</div>
+        <div style="font-family:var(--mono);font-size:14px;color:${master.sentimentScore==null?'var(--ink3)':master.sentimentScore>=65?'var(--green)':master.sentimentScore>=50?'var(--gold)':'var(--red)'};">${master.sentimentScore!=null?master.sentimentScore+'/100':'No data'}</div>
+      </div>
+    </div>
+    ${master.divergence?`
+    <div style="background:var(--surface2);border-left:3px solid ${master.divergence.color};border-radius:4px;padding:8px 10px;">
+      <div style="font-family:var(--mono);font-size:9px;color:${master.divergence.color};font-weight:600;">${master.divergence.label}</div>
+      <div style="font-family:var(--sans);font-size:10px;color:var(--ink2);margin-top:3px;line-height:1.4;">${master.divergence.detail}</div>
+    </div>`:''}
+  </div>
+
   <div class="sec-t">VALUATION (TTM)</div>
   <div class="fg">
     <div class="fi"><div class="fl">P/E Ratio</div><div class="fv ${pe?(pe<20?'g':pe<30?'n':'r'):'n'}">${pe?f1(pe):'—'}</div></div>
